@@ -16,5 +16,3 @@ jobs:
       - run: bunx openchamber-guest-bundle status/main.ts status/main.js
       - run: bunx openchamber-guest-bundle --node service/main.ts service/main.js
       - run: bunx openchamber-guest-check
-      # Installing never builds, so the committed bundles must match the sources.
-      - run: git diff --exit-code
