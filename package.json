@@ -1,0 +1,34 @@
+{
+  "name": "agentic-tasks",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=2.7.0"
+    },
+    "id": "agentic-tasks",
+    "name": "Agentic tasks",
+    "icon": "checkbox-circle",
+    "contributes": {
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host"
+      },
+      "statusSection": {
+        "entry": "status/index.html",
+        "title": "Agentic tasks",
+        "height": 120
+      }
+    }
+  },
+  "dependencies": {
+    "@openchamber/sdk": "2.7.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "@types/node": "^26.6.6",
+    "typescript": "5.9.3"
+  }
+}
