@@ -13,12 +13,9 @@ if (!port || !token) {
 var DEFAULT_BASE = "http://127.0.0.1:8600";
 var CONFIG_FILE = path.join(dataDir, "config.json");
 var TASKS_TTL = 30000;
-var INDEX_TTL = 60000;
-var SCAN_CONCURRENCY = 16;
 var REQUEST_TIMEOUT = 6000;
 var baseUrl = readBaseUrl();
 var tasksCache = null;
-var indexCache = null;
 function readBaseUrl() {
   try {
     const raw = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
@@ -40,7 +37,6 @@ function writeBaseUrl(value) {
 }
 function clearCaches() {
   tasksCache = null;
-  indexCache = null;
 }
 async function apiGet(pathname) {
   const res = await fetch(`${baseUrl}${pathname}`, {
@@ -89,45 +85,28 @@ async function loadTasks(force = false) {
   tasksCache = { at: Date.now(), tasks };
   return tasks;
 }
-async function loadIndex(force = false) {
-  if (!force && indexCache && Date.now() - indexCache.at < INDEX_TTL)
-    return indexCache.map;
-  const tasks = await loadTasks(force);
-  const map = new Map;
-  const queue = [...tasks];
-  const worker = async () => {
-    for (;; ) {
-      const task = queue.shift();
-      if (!task)
-        return;
-      try {
-        const rows = await apiGet(`/api/tasks/${encodeURIComponent(task.id)}/sessions`);
-        if (!Array.isArray(rows))
-          continue;
-        for (const row of rows) {
-          if (!row || typeof row.session_id !== "string" || typeof row.id !== "string")
-            continue;
-          const list = map.get(row.session_id) ?? [];
-          list.push({ task, rowId: row.id });
-          map.set(row.session_id, list);
-        }
-      } catch {}
-    }
-  };
-  await Promise.all(Array.from({ length: SCAN_CONCURRENCY }, worker));
-  indexCache = { at: Date.now(), map };
-  return map;
-}
-function linksFor(sessionId, map) {
-  const rows = map.get(sessionId) ?? [];
-  return rows.map(({ task, rowId }) => ({
-    id: task.id,
-    rowId,
-    title: task.title,
-    status: task.status,
-    priority: task.priority,
-    url: taskUrl(task.id)
-  })).sort((a, b) => a.title.localeCompare(b.title));
+async function linksFor(sessionId) {
+  const raw = await apiGet(`/api/sessions/${encodeURIComponent(sessionId)}`);
+  if (!Array.isArray(raw))
+    throw new Error("/api/sessions did not answer a list");
+  const links = [];
+  for (const entry of raw) {
+    const task = entry?.task;
+    const row = entry?.session;
+    if (!task || typeof task.id !== "string" || typeof task.title !== "string")
+      continue;
+    if (!row || typeof row.id !== "string")
+      continue;
+    links.push({
+      id: task.id,
+      rowId: row.id,
+      title: task.title,
+      status: typeof task.status === "string" ? task.status : "open",
+      priority: typeof task.priority === "number" ? task.priority : 0,
+      url: taskUrl(task.id)
+    });
+  }
+  return links.sort((a, b) => a.title.localeCompare(b.title));
 }
 var IN_FLIGHT = new Set(["open", "in_progress", "blocked"]);
 function searchTasks(tasks, query, skip) {
@@ -166,10 +145,9 @@ var unreachable = (error) => {
   const detail = error instanceof Error && error.message ? ` (${error.message})` : "";
   return `Nothing answered at ${baseUrl}${detail}`;
 };
-async function stateFor(sessionId, force = false) {
+async function stateFor(sessionId) {
   try {
-    const map = await loadIndex(force);
-    return { ok: true, baseUrl, links: linksFor(sessionId, map) };
+    return { ok: true, baseUrl, links: await linksFor(sessionId) };
   } catch (error) {
     return { ok: false, baseUrl, error: unreachable(error) };
   }
@@ -179,7 +157,7 @@ async function route(pathname, url, req) {
     const sessionId = (url.searchParams.get("session") ?? "").trim();
     if (!sessionId)
       return [400, { ok: false, error: "A session id is required" }];
-    return [200, await stateFor(sessionId, url.searchParams.get("refresh") === "1")];
+    return [200, await stateFor(sessionId)];
   }
   if (pathname === "/tasks" && req.method === "GET") {
     const query = url.searchParams.get("q") ?? "";
@@ -198,16 +176,15 @@ async function route(pathname, url, req) {
     if (!sessionId || !taskId)
       return [400, { ok: false, error: "A session and a task are required" }];
     try {
-      const map = await loadIndex();
-      const linked = linksFor(sessionId, map).some((link) => link.id === taskId);
-      if (!linked) {
+      const already = (await linksFor(sessionId)).some((link) => link.id === taskId);
+      if (!already) {
         await apiSend("POST", `/api/tasks/${encodeURIComponent(taskId)}/sessions`, {
           session_id: sessionId,
           label: typeof body.label === "string" ? body.label.slice(0, 200) : "",
           cwd: typeof body.cwd === "string" && body.cwd.trim() ? body.cwd.trim() : undefined
         });
       }
-      return [200, await stateFor(sessionId, true)];
+      return [200, await stateFor(sessionId)];
     } catch (error) {
       return [200, { ok: false, baseUrl, error: unreachable(error), links: [] }];
     }
@@ -219,12 +196,11 @@ async function route(pathname, url, req) {
     if (!sessionId || !taskId)
       return [400, { ok: false, error: "A session and a task are required" }];
     try {
-      const map = await loadIndex();
-      const link = linksFor(sessionId, map).find((row) => row.id === taskId);
+      const link = (await linksFor(sessionId)).find((row) => row.id === taskId);
       if (!link)
-        return [200, { ok: true, baseUrl, links: linksFor(sessionId, map) }];
+        return [200, await stateFor(sessionId)];
       await apiSend("DELETE", `/api/tasks/${encodeURIComponent(taskId)}/sessions/${encodeURIComponent(link.rowId)}`, undefined);
-      return [200, await stateFor(sessionId, true)];
+      return [200, await stateFor(sessionId)];
     } catch (error) {
       return [200, { ok: false, baseUrl, error: unreachable(error), links: [] }];
     }

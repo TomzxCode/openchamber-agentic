@@ -27,10 +27,9 @@ desktop only; VS Code and the phone load no extensions.
   opens a 560px anchored popover (the same page, `surface: "popover"`) with a
   task search, so the list is wider than the sidebar; a host without popovers
   gets the search inline instead.
-- `service/` talks to Agentic over its HTTP API. Agentic lists sessions under a
-  task only, so the service reads every task's sessions once and keeps the
-  result for a minute (`/state` answers in about 15 ms from that cache, about
-  400 ms cold for 340 tasks). Linking and unlinking clear it.
+- `service/` talks to Agentic over its HTTP API. A chat's tasks are read in one
+  call (`GET /api/sessions/{session_id}`); the task list behind the search is
+  cached for 30 seconds, and linking or unlinking clears it.
 - `GET /health`, `GET /state?session=`, `GET /tasks?q=&skip=`, `POST /link`,
   `POST /unlink`, and `POST /config` make up the service.
 

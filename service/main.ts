@@ -15,8 +15,6 @@ if (!port || !token) {
 const DEFAULT_BASE = 'http://127.0.0.1:8600';
 const CONFIG_FILE = path.join(dataDir, 'config.json');
 const TASKS_TTL = 30_000;
-const INDEX_TTL = 60_000;
-const SCAN_CONCURRENCY = 16;
 const REQUEST_TIMEOUT = 6000;
 
 type TaskRow = { id: string; title: string; status: string; priority: number };
@@ -32,7 +30,6 @@ type LinkRow = {
 
 let baseUrl = readBaseUrl();
 let tasksCache: { at: number; tasks: TaskRow[] } | null = null;
-let indexCache: { at: number; map: Map<string, Array<{ task: TaskRow; rowId: string }>> } | null = null;
 
 function readBaseUrl(): string {
   try {
@@ -57,7 +54,6 @@ function writeBaseUrl(value: string): void {
 
 function clearCaches(): void {
   tasksCache = null;
-  indexCache = null;
 }
 
 async function apiGet(pathname: string): Promise<unknown> {
@@ -108,50 +104,28 @@ async function loadTasks(force = false): Promise<TaskRow[]> {
 }
 
 /**
- * Agentic records a hand-attached session per task, and its API only lists
- * sessions under a task, so the only way to ask "which tasks is this session
- * on" is to read every task's sessions once and keep the answer briefly.
+ * The tasks this chat is recorded against, read in one call: Agentic answers a
+ * session's tasks directly, so there is no scanning and no cache to go stale.
  */
-async function loadIndex(force = false): Promise<Map<string, Array<{ task: TaskRow; rowId: string }>>> {
-  if (!force && indexCache && Date.now() - indexCache.at < INDEX_TTL) return indexCache.map;
-  const tasks = await loadTasks(force);
-  const map = new Map<string, Array<{ task: TaskRow; rowId: string }>>();
-  const queue = [...tasks];
-  const worker = async (): Promise<void> => {
-    for (;;) {
-      const task = queue.shift();
-      if (!task) return;
-      try {
-        const rows = await apiGet(`/api/tasks/${encodeURIComponent(task.id)}/sessions`);
-        if (!Array.isArray(rows)) continue;
-        for (const row of rows) {
-          if (!row || typeof row.session_id !== 'string' || typeof row.id !== 'string') continue;
-          const list = map.get(row.session_id) ?? [];
-          list.push({ task, rowId: row.id });
-          map.set(row.session_id, list);
-        }
-      } catch {
-        // One unreadable task must not empty the whole section.
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: SCAN_CONCURRENCY }, worker));
-  indexCache = { at: Date.now(), map };
-  return map;
-}
-
-function linksFor(sessionId: string, map: Map<string, Array<{ task: TaskRow; rowId: string }>>): LinkRow[] {
-  const rows = map.get(sessionId) ?? [];
-  return rows
-    .map(({ task, rowId }) => ({
+async function linksFor(sessionId: string): Promise<LinkRow[]> {
+  const raw = await apiGet(`/api/sessions/${encodeURIComponent(sessionId)}`);
+  if (!Array.isArray(raw)) throw new Error('/api/sessions did not answer a list');
+  const links: LinkRow[] = [];
+  for (const entry of raw as Array<{ session?: any; task?: any }>) {
+    const task = entry?.task;
+    const row = entry?.session;
+    if (!task || typeof task.id !== 'string' || typeof task.title !== 'string') continue;
+    if (!row || typeof row.id !== 'string') continue;
+    links.push({
       id: task.id,
-      rowId,
+      rowId: row.id,
       title: task.title,
-      status: task.status,
-      priority: task.priority,
+      status: typeof task.status === 'string' ? task.status : 'open',
+      priority: typeof task.priority === 'number' ? task.priority : 0,
       url: taskUrl(task.id),
-    }))
-    .sort((a, b) => a.title.localeCompare(b.title));
+    });
+  }
+  return links.sort((a, b) => a.title.localeCompare(b.title));
 }
 
 const IN_FLIGHT = new Set(['open', 'in_progress', 'blocked']);
@@ -194,10 +168,9 @@ const unreachable = (error: unknown): string => {
   return `Nothing answered at ${baseUrl}${detail}`;
 };
 
-async function stateFor(sessionId: string, force = false): Promise<unknown> {
+async function stateFor(sessionId: string): Promise<unknown> {
   try {
-    const map = await loadIndex(force);
-    return { ok: true, baseUrl, links: linksFor(sessionId, map) };
+    return { ok: true, baseUrl, links: await linksFor(sessionId) };
   } catch (error) {
     return { ok: false, baseUrl, error: unreachable(error) };
   }
@@ -207,7 +180,7 @@ async function route(pathname: string, url: URL, req: http.IncomingMessage): Pro
   if (pathname === '/state' && req.method === 'GET') {
     const sessionId = (url.searchParams.get('session') ?? '').trim();
     if (!sessionId) return [400, { ok: false, error: 'A session id is required' }];
-    return [200, await stateFor(sessionId, url.searchParams.get('refresh') === '1')];
+    return [200, await stateFor(sessionId)];
   }
 
   if (pathname === '/tasks' && req.method === 'GET') {
@@ -227,16 +200,15 @@ async function route(pathname: string, url: URL, req: http.IncomingMessage): Pro
     const taskId = typeof body.taskId === 'string' ? body.taskId.trim() : '';
     if (!sessionId || !taskId) return [400, { ok: false, error: 'A session and a task are required' }];
     try {
-      const map = await loadIndex();
-      const linked = linksFor(sessionId, map).some((link) => link.id === taskId);
-      if (!linked) {
+      const already = (await linksFor(sessionId)).some((link) => link.id === taskId);
+      if (!already) {
         await apiSend('POST', `/api/tasks/${encodeURIComponent(taskId)}/sessions`, {
           session_id: sessionId,
           label: typeof body.label === 'string' ? body.label.slice(0, 200) : '',
           cwd: typeof body.cwd === 'string' && body.cwd.trim() ? body.cwd.trim() : undefined,
         });
       }
-      return [200, await stateFor(sessionId, true)];
+      return [200, await stateFor(sessionId)];
     } catch (error) {
       return [200, { ok: false, baseUrl, error: unreachable(error), links: [] }];
     }
@@ -248,11 +220,10 @@ async function route(pathname: string, url: URL, req: http.IncomingMessage): Pro
     const taskId = typeof body.taskId === 'string' ? body.taskId.trim() : '';
     if (!sessionId || !taskId) return [400, { ok: false, error: 'A session and a task are required' }];
     try {
-      const map = await loadIndex();
-      const link = linksFor(sessionId, map).find((row) => row.id === taskId);
-      if (!link) return [200, { ok: true, baseUrl, links: linksFor(sessionId, map) }];
+      const link = (await linksFor(sessionId)).find((row) => row.id === taskId);
+      if (!link) return [200, await stateFor(sessionId)];
       await apiSend('DELETE', `/api/tasks/${encodeURIComponent(taskId)}/sessions/${encodeURIComponent(link.rowId)}`, undefined);
-      return [200, await stateFor(sessionId, true)];
+      return [200, await stateFor(sessionId)];
     } catch (error) {
       return [200, { ok: false, baseUrl, error: unreachable(error), links: [] }];
     }

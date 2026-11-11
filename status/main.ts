@@ -204,7 +204,7 @@ const paintList = () => {
       size: 'xs',
       variant: 'ghost',
       disabled: busy,
-      onClick: () => void loadState(true),
+      onClick: () => void loadState(),
     }),
   );
 };
@@ -518,7 +518,7 @@ const runSearch = async () => {
   renderResults();
 };
 
-const loadState = async (refresh = false) => {
+const loadState = async () => {
   if (!sessionId) return;
   const seq = ++stateSeq;
   loading = true;
@@ -527,7 +527,7 @@ const loadState = async (refresh = false) => {
   const res = await host
     .serviceRequest({
       method: 'GET',
-      path: `/state?session=${encodeURIComponent(sessionId)}${refresh ? '&refresh=1' : ''}`,
+      path: `/state?session=${encodeURIComponent(sessionId)}`,
     })
     .catch(() => null);
   if (seq !== stateSeq) return;
@@ -657,8 +657,7 @@ const saveSettings = async () => {
 host.onPopoverClosed(({ id }) => {
   if (isPopover || id !== popoverId) return;
   popoverId = null;
-  // The picker may have linked a task; the service has already dropped its
-  // cache, so this read is the fresh one.
+  // The picker may have linked a task, so re-read rather than reuse the list.
   void loadState();
 });
 
